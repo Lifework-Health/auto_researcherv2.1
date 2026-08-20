@@ -20,6 +20,12 @@ from auto_researcher.tasks.feta_unet_direct.trainer import (
 )
 from auto_researcher.tasks.feta_unet_search.configuration import (
     FEATURE_WIDTH_PROFILES,
+    V6_ARCHITECTURE_BUDGET,
+    V6_BASIC_UNET_FEATURE_PROFILES,
+    V6_MAXIMUM_TRAINABLE_PARAMETERS,
+    V6_MINIMUM_TRAINABLE_PARAMETERS,
+    V6_PIXELSHUFFLE_FEATURE_PROFILES,
+    V6_UPSAMPLE_MODES,
     FeTAUNetSearchConfiguration,
 )
 from auto_researcher.tasks.feta_seg.transforms import create_transforms
@@ -64,6 +70,49 @@ def test_v5_plain_and_residual_unet_variants_build_distinct_models():
     assert [item.residual_units for item in configurations] == [0, 0, 2]
     assert len(set(identities)) == 3
     assert all(item > 0 for item in parameters)
+
+
+@pytest.mark.parametrize(
+    ("feature_width", "upsample"),
+    [
+        (feature_width, upsample)
+        for feature_width in V6_BASIC_UNET_FEATURE_PROFILES
+        for upsample in V6_UPSAMPLE_MODES
+        if upsample != "pixelshuffle"
+        or feature_width in V6_PIXELSHUFFLE_FEATURE_PROFILES
+    ],
+)
+def test_v6_basic_unet_profiles_respect_parameter_budget(
+    feature_width: str, upsample: str
+):
+    configuration = FeTAUNetSearchConfiguration(
+        model_variant="basic_unet",
+        feature_width=feature_width,
+        architecture_budget=V6_ARCHITECTURE_BUDGET,
+        upsample=upsample,
+    )
+    model = create_unet_model(configuration)
+    parameter_count = trainable_parameter_count(model)
+
+    assert configuration.features == V6_BASIC_UNET_FEATURE_PROFILES[feature_width]
+    assert V6_MINIMUM_TRAINABLE_PARAMETERS <= parameter_count
+    assert parameter_count <= V6_MAXIMUM_TRAINABLE_PARAMETERS
+
+
+@pytest.mark.parametrize(
+    "feature_width",
+    sorted(set(V6_BASIC_UNET_FEATURE_PROFILES) - V6_PIXELSHUFFLE_FEATURE_PROFILES),
+)
+def test_v6_rejects_registered_pixelshuffle_profiles_over_parameter_budget(
+    feature_width: str,
+):
+    with pytest.raises(ValueError, match="v6_architecture_invalid"):
+        FeTAUNetSearchConfiguration(
+            model_variant="basic_unet",
+            feature_width=feature_width,
+            architecture_budget=V6_ARCHITECTURE_BUDGET,
+            upsample="pixelshuffle",
+        )
 
 
 @pytest.mark.parametrize("variant", ["dice_ce", "dice_focal", "dice_tversky"])

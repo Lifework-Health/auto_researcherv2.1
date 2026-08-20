@@ -1,0 +1,127 @@
+# Single-GPU, 20-hour V6 BasicUNet architecture campaign.
+# 12 roots, 18 children and 6 grandchildren produce 36 unique 25-epoch
+# trajectories. Promotions continue 10 to epoch 50, 5 to 100 and 3 to 150.
+task: {id: feta_unet_search, version: "1.0"}
+
+agents:
+  mode: live
+  provider: anthropic
+  model_id: claude-sonnet-4-5-20250929
+  pricing:
+    version: anthropic-sonnet45-usd-3-15-v1
+    input_cost_per_million_tokens: 3.0
+    output_cost_per_million_tokens: 15.0
+    cache_write_cost_per_million_tokens: null
+    cache_read_cost_per_million_tokens: null
+    currency: USD
+  budget:
+    maximum_hypothesis_calls_per_cycle: 1
+    maximum_planner_calls_per_cycle: 1
+    maximum_attempts_per_agent_call: 4
+    maximum_input_context_size: 48000
+    maximum_output_tokens: 2048
+    maximum_cost_per_call: 0.50
+    maximum_total_model_calls: 384
+  hypothesis: {temperature: 0.0, maximum_output_tokens: 1200, timeout_seconds: 120, maximum_attempts: 4, maximum_cost_per_call: 0.50, prompt_version: 2.0.0, structured_output_strategy: pydantic}
+  planner: {temperature: 0.0, maximum_output_tokens: 1600, timeout_seconds: 120, maximum_attempts: 4, maximum_cost_per_call: 0.50, prompt_version: 2.0.0, structured_output_strategy: pydantic}
+
+openevolve_development_mutation:
+  protocol_version: development-live-openevolve-runtime-v1
+  mode: local_development
+  acknowledgement: public-data-non-production-development
+  maximum_model_calls: 96
+  maximum_total_cost_usd: 50.0
+  usage_log_file: /absolute/path/to/runtime/openevolve-model-usage.jsonl
+  credential: {logical_name: anthropic_api_key, provider: environment, provider_identifier: ANTHROPIC_API_KEY, version: null, required: true}
+  model:
+    provider: anthropic
+    model_id: claude-sonnet-4-5-20250929
+    temperature: 0.25
+    maximum_output_tokens: 4096
+    timeout_seconds: 180
+    maximum_attempts: 1
+    maximum_cost_per_call: 0.40
+    prompt_version: openevolve-mutation-prompt-v2
+    structured_output_strategy: pydantic
+    pricing: {version: anthropic-sonnet45-usd-3-15-v1, input_cost_per_million_tokens: 3.0, output_cost_per_million_tokens: 15.0, cache_write_cost_per_million_tokens: null, cache_read_cost_per_million_tokens: null, currency: USD}
+
+search:
+  type: OPTUNA
+  trial_budget: 4
+  seed: 20260820
+  fixed: {maximum_epochs: 25}
+  openevolve:
+    population_size: 1
+    maximum_generations: 4
+    maximum_candidate_evaluations: 5
+    maximum_wall_time_seconds: 72000
+    maximum_model_calls: 4
+    maximum_failed_candidates: 5
+    maximum_consecutive_failures: 5
+    maximum_artefact_bytes: 20000000
+    random_seed: 20260820
+    objective_direction: MAXIMIZE
+    objective_threshold: null
+    sandbox_policy_id: openevolve-sandbox-v1
+    candidate_cpu_time_seconds: 2
+    candidate_wall_time_seconds: 3.0
+    candidate_memory_bytes: 268435456
+    candidate_process_limit: 1
+    candidate_output_bytes: 64000
+    candidate_log_bytes: 8000
+    candidate_file_count_limit: 8
+    candidate_workspace_bytes: 1048576
+    candidate_file_size_bytes: 64000
+
+runtime:
+  data_dir: /absolute/path/to/feta
+  output_dir: /absolute/path/to/runtime/output
+  workspace_dir: /absolute/path/to/runtime/workspace
+  environment: {CUDA_VISIBLE_DEVICES: "0"}
+  options:
+    protected_storage_acknowledged: true
+    workspace_namespace: feta_unet_campaign_v6
+    shared_preprocessing_cache: true
+    openevolve_fidelity: 25
+    campaign_seconds_per_epoch: 39.0
+    campaign_seconds_per_epoch_by_model_variant: {basic_unet: 39.0, unet_plain: 60.0, unet_residual: 60.0}
+    campaign_finalisation_reserve_seconds: 10800.0
+    campaign_prior_results: 30
+    continue_after_failed_candidate: true
+    initial_incumbent_configuration:
+      maximum_epochs: 150
+      model_variant: basic_unet
+      feature_width: v6_balanced_64
+      architecture_budget: basicunet-15m-150m-v1
+      upsample: deconv
+      activation: PReLU
+      norm: instance
+      optimizer: Adam
+      lr_schedule: polynomial
+      loss_variant: dice_focal
+      learning_rate: 0.00014676947772184417
+      weight_decay: 0.000009170939006065463
+      dropout: 0.08363354043325907
+      dice_weight: 1.2833957004567855
+      positive_negative_ratio: "2:1"
+      augmentation_policy: intensity
+    initial_campaign_observations:
+      - "Verified V5 fold-0 champion mean macro Dice was 0.8192219633033265 at best epoch 130 for an OPTUNA BasicUNet policy."
+      - "V5 rank correlation was 0.6190476190476191 from 25 to 50 epochs and 0.4 from 50 to 100 epochs, so broader later-fidelity graduation is warranted."
+      - "V5 screened 19 plain and 11 residual U-Net executions, but the final champion remained BasicUNet."
+      - "A separately trained U-Net reportedly reached approximately 0.84 under a believed-comparable evaluation, but its architecture and training policy remain deliberately withheld."
+    campaign_portfolio:
+      version: feta-basicunet-architecture-tree-12-18-6-10-5-3-v1
+      root_screening: {OPTUNA: 4, OPENEVOLVE: 4, DIRECT: 4}
+      root_model_variants: {basic_unet: 4}
+      root_parent_count: 6
+      children_per_parent: {OPTUNA: 1, OPENEVOLVE: 1, DIRECT: 1}
+      child_parent_count: 3
+      grandchildren_per_parent: {OPTUNA: 1, OPENEVOLVE: 1}
+      promotion_targets: {"50": 10, "100": 5, "150": 3}
+      wildcard_counts: {"50": 3, "100": 2, "150": 1}
+      direct_root_configurations:
+        - {maximum_epochs: 25, model_variant: basic_unet, feature_width: v6_balanced_64, architecture_budget: basicunet-15m-150m-v1, upsample: deconv, activation: PReLU, norm: instance, optimizer: Adam, lr_schedule: polynomial, loss_variant: dice_focal, learning_rate: 0.00014676947772184417, weight_decay: 0.000009170939006065463, dropout: 0.08363354043325907, dice_weight: 1.2833957004567855, positive_negative_ratio: "2:1", augmentation_policy: intensity}
+        - {maximum_epochs: 25, model_variant: basic_unet, feature_width: v6_deep_64, architecture_budget: basicunet-15m-150m-v1, upsample: pixelshuffle, activation: LeakyReLU, norm: group, optimizer: AdamW, lr_schedule: cosine, loss_variant: dice_tversky, learning_rate: 0.00012, weight_decay: 0.00002, dropout: 0.05, dice_weight: 1.2, positive_negative_ratio: "2:1", augmentation_policy: combined}
+        - {maximum_epochs: 25, model_variant: basic_unet, feature_width: v6_balanced_96, architecture_budget: basicunet-15m-150m-v1, upsample: nontrainable, activation: ReLU, norm: instance, optimizer: Adam, lr_schedule: polynomial, loss_variant: dice_focal, learning_rate: 0.00018, weight_decay: 0.000006, dropout: 0.08, dice_weight: 1.3, positive_negative_ratio: "3:1", augmentation_policy: geometric}
+        - {maximum_epochs: 25, model_variant: basic_unet, feature_width: v6_decoder_96, architecture_budget: basicunet-15m-150m-v1, upsample: deconv, activation: PReLU, norm: group, optimizer: AdamW, lr_schedule: cosine, loss_variant: dice_ce, learning_rate: 0.0002, weight_decay: 0.000015, dropout: 0.1, dice_weight: 1.15, positive_negative_ratio: "1:1", augmentation_policy: reference_light}

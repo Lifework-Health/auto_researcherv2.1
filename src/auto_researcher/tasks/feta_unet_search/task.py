@@ -42,8 +42,8 @@ from auto_researcher.tasks.feta_seg.splits import (
 )
 from auto_researcher.tasks.feta_unet_direct.task import FeTAUNetDirectTask
 from auto_researcher.tasks.feta_unet_search.configuration import (
-    AUGMENTATION_POLICIES,
     ACTIVATIONS,
+    AUGMENTATION_POLICIES,
     CANDIDATE_CONFIGURATION_FIELDS,
     CONFIGURATION_SCHEMA_VERSION,
     DICE_WEIGHT_BOUNDS,
@@ -58,6 +58,12 @@ from auto_researcher.tasks.feta_unet_search.configuration import (
     OPTIMISERS,
     POSITIVE_NEGATIVE_RATIOS,
     SEARCH_ARCHITECTURE_FAMILY_ID,
+    V6_ARCHITECTURE_BUDGET,
+    V6_BASIC_UNET_FEATURE_PROFILES,
+    V6_MAXIMUM_TRAINABLE_PARAMETERS,
+    V6_MINIMUM_TRAINABLE_PARAMETERS,
+    V6_OPTUNA_FEATURE_PROFILES,
+    V6_UPSAMPLE_MODES,
     WEIGHT_DECAY_BOUNDS,
     FeTAUNetSearchConfiguration,
     baseline_search_configuration,
@@ -151,18 +157,35 @@ class FeTAUNetSearchTask(FeTAUNetDirectTask):
             {SearchType.DIRECT, SearchType.OPTUNA, SearchType.OPENEVOLVE}
         ):
             raise ValueError("feta_unet_search_type_unsupported")
+        v6_mode = (
+            contract.constraints.get("architecture_search_mode")
+            == V6_ARCHITECTURE_BUDGET
+        )
         expected = {
             "dataset_manifest_hash": EXPECTED_MANIFEST_HASH,
             "split_hash": EXPECTED_SPLIT_HASH,
             "fold_hash": EXPECTED_FOLD_HASH,
             "architecture_identity": SEARCH_ARCHITECTURE_FAMILY_ID,
-            "architecture_model_variants": list(MODEL_VARIANTS),
-            "architecture_feature_width_profiles": list(FEATURE_WIDTH_PROFILES),
+            "architecture_model_variants": ["basic_unet"]
+            if v6_mode
+            else list(MODEL_VARIANTS),
+            "architecture_feature_width_profiles": list(
+                V6_BASIC_UNET_FEATURE_PROFILES
+                if v6_mode
+                else FEATURE_WIDTH_PROFILES
+            ),
             "holdout_policy": "sealed-no-evaluation",
             "search_scope": "development-fold-0-only",
         }
         if any(
             contract.constraints.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError("feta_unet_search_scientific_identity_mismatch")
+        if v6_mode and (
+            contract.constraints.get("architecture_trainable_parameter_minimum")
+            != V6_MINIMUM_TRAINABLE_PARAMETERS
+            or contract.constraints.get("architecture_trainable_parameter_maximum")
+            != V6_MAXIMUM_TRAINABLE_PARAMETERS
         ):
             raise ValueError("feta_unet_search_scientific_identity_mismatch")
 
@@ -208,6 +231,35 @@ class FeTAUNetSearchTask(FeTAUNetDirectTask):
         if isinstance(fidelity, bool) or not isinstance(fidelity, int):
             raise ValueError("feta_unet_search_fidelity_invalid")
         fixed = baseline_search_configuration(fidelity)
+        v6_architecture = (
+            raw_fixed.get("architecture_budget") == V6_ARCHITECTURE_BUDGET
+        )
+        registered_fixed_configuration = {
+            key: value
+            for key, value in fixed.items()
+            if key == "maximum_epochs"
+            or (
+                key not in CANDIDATE_CONFIGURATION_FIELDS
+                and key
+                not in {
+                    "features",
+                    "channels",
+                    "network_family",
+                    "residual_units",
+                }
+            )
+        }
+        if v6_architecture:
+            v6_upsample = raw_fixed.get("upsample", "deconv")
+            if v6_upsample not in V6_UPSAMPLE_MODES:
+                raise ValueError("feta_unet_v6_upsample_invalid")
+            # These are task-owned V6 scientific context, not Optuna axes. Register
+            # them before structural narrowing so a portfolio request can bind the
+            # architecture envelope without being mistaken for an unknown field.
+            registered_fixed_configuration.update(
+                architecture_budget=V6_ARCHITECTURE_BUDGET,
+                upsample=v6_upsample,
+            )
         registered = OptunaStudySpec(
             schema_version="1.0",
             task_id=self.task_id,
@@ -249,7 +301,11 @@ class FeTAUNetSearchTask(FeTAUNetDirectTask):
                 ),
                 CategoricalParameterSpec(
                     name="feature_width",
-                    choices=tuple(FEATURE_WIDTH_PROFILES),
+                    choices=tuple(
+                        V6_OPTUNA_FEATURE_PROFILES
+                        if v6_architecture
+                        else FEATURE_WIDTH_PROFILES
+                    ),
                 ),
                 CategoricalParameterSpec(
                     name="activation",
@@ -272,21 +328,7 @@ class FeTAUNetSearchTask(FeTAUNetDirectTask):
                     choices=LOSS_VARIANTS,
                 ),
             ),
-            fixed_configuration={
-                key: value
-                for key, value in fixed.items()
-                if key == "maximum_epochs"
-                or (
-                    key not in CANDIDATE_CONFIGURATION_FIELDS
-                    and key
-                    not in {
-                        "features",
-                        "channels",
-                        "network_family",
-                        "residual_units",
-                    }
-                )
-            },
+            fixed_configuration=registered_fixed_configuration,
             trial_budget=request.experiment_budget,
             seed=20260807,
             sampler="TPE",
@@ -377,6 +419,7 @@ class FeTAUNetSearchTask(FeTAUNetDirectTask):
             "incumbent_training_policy": policy.model_dump(mode="json"),
             "incumbent_primary_score": incumbent.primary_score,
             "incumbent_search_type": incumbent.search_type.value,
+            "incumbent_experiment_id": incumbent.experiment_reference,
             "prior_verified_results": [
                 {
                     "search_type": finding.search_type.value,
@@ -554,6 +597,19 @@ class FeTAUNetSearchTask(FeTAUNetDirectTask):
     ) -> TaskAgentContext:
         del search_capabilities
         self.validate_contract(contract)
+        v6_mode = (
+            contract.constraints.get("architecture_search_mode")
+            == V6_ARCHITECTURE_BUDGET
+        )
+        agent_model_variants = ("basic_unet",) if v6_mode else MODEL_VARIANTS
+        direct_feature_profiles = (
+            V6_OPTUNA_FEATURE_PROFILES if v6_mode else tuple(FEATURE_WIDTH_PROFILES)
+        )
+        all_agent_feature_profiles = (
+            tuple(V6_BASIC_UNET_FEATURE_PROFILES)
+            if v6_mode
+            else tuple(FEATURE_WIDTH_PROFILES)
+        )
         return TaskAgentContext(
             task_id=self.task_id,
             task_version=self.task_version,
@@ -601,9 +657,13 @@ class FeTAUNetSearchTask(FeTAUNetDirectTask):
                 SearchType.OPENEVOLVE,
             ),
             direct_configuration_schema={
-                "maximum_epochs": list(FIDELITY_LEVELS),
-                "model_variant": list(MODEL_VARIANTS),
-                "feature_width": list(FEATURE_WIDTH_PROFILES),
+                "maximum_epochs": [25] if v6_mode else list(FIDELITY_LEVELS),
+                "model_variant": list(agent_model_variants),
+                "feature_width": list(direct_feature_profiles),
+                "architecture_budget": [V6_ARCHITECTURE_BUDGET]
+                if v6_mode
+                else ["legacy"],
+                "upsample": ["deconv"],
                 "activation": list(ACTIVATIONS),
                 "norm": list(NORMALISATIONS),
                 "optimizer": list(OPTIMISERS),
@@ -623,8 +683,8 @@ class FeTAUNetSearchTask(FeTAUNetDirectTask):
                 "dice_weight": list(DICE_WEIGHT_BOUNDS),
                 "positive_negative_ratio": list(POSITIVE_NEGATIVE_RATIOS),
                 "augmentation_policy": list(AUGMENTATION_POLICIES),
-                "model_variant": list(MODEL_VARIANTS),
-                "feature_width": list(FEATURE_WIDTH_PROFILES),
+                "model_variant": list(agent_model_variants),
+                "feature_width": list(direct_feature_profiles),
                 "activation": list(ACTIVATIONS),
                 "norm": list(NORMALISATIONS),
                 "optimizer": list(OPTIMISERS),
@@ -641,8 +701,13 @@ class FeTAUNetSearchTask(FeTAUNetDirectTask):
                     "dice_weight": list(DICE_WEIGHT_BOUNDS),
                     "positive_negative_ratio": list(POSITIVE_NEGATIVE_RATIOS),
                     "augmentation_policy": list(AUGMENTATION_POLICIES),
-                    "model_variant": list(MODEL_VARIANTS),
-                    "feature_width": list(FEATURE_WIDTH_PROFILES),
+                    "model_variant": list(agent_model_variants),
+                    "feature_width": list(all_agent_feature_profiles),
+                    "features": "six integer channel widths",
+                    "architecture_budget": [V6_ARCHITECTURE_BUDGET]
+                    if v6_mode
+                    else ["legacy"],
+                    "upsample": list(V6_UPSAMPLE_MODES),
                     "activation": list(ACTIVATIONS),
                     "norm": list(NORMALISATIONS),
                     "optimizer": list(OPTIMISERS),

@@ -1,12 +1,12 @@
-contract_id: feta-basic-unet-fold0-campaign-contract
+contract_id: feta-basic-unet-fold0-v6-architecture-campaign-contract
 schema_version: "1.0"
 task_id: feta_unet_search
 task_version: "1.0"
 objective_version: feta-unet-fold0-bounded-family-tree-search-macro-dice-v4
 primary_metric: mean_subject_macro_dice
 task_constraints_version: feta-unet-search-configuration-v4
-question: Which bounded U-Net lineage improves fold-0 development macro Dice?
-objective: maximise U-Net fold-0 development mean subject-level macro Dice through lineage-aware tree search
+question: Which bounded BasicUNet architecture lineage improves fold-0 development macro Dice?
+objective: maximise BasicUNet fold-0 development mean subject-level macro Dice through lineage-aware architecture and training-policy search
 constraints:
   dataset_release: feta-2.1-export-80
   dataset_manifest_hash: 6d6f375fda99512a93bbaaa715d6edb5031c4d4f2356584b578f2ebd9631eacf
@@ -17,8 +17,11 @@ constraints:
   holdout_policy: sealed-no-evaluation
   search_scope: development-fold-0-only
   architecture_identity: monai-unet-3d-bounded-family-v4
-  architecture_model_variants: [basic_unet, unet_plain, unet_residual]
-  architecture_feature_width_profiles: [narrow, baseline, wide]
+  architecture_search_mode: basicunet-15m-150m-v1
+  architecture_model_variants: [basic_unet]
+  architecture_feature_width_profiles: [v6_balanced_64, v6_balanced_80, v6_balanced_96, v6_balanced_112, v6_balanced_128, v6_balanced_144, v6_deep_64, v6_deep_80, v6_decoder_96]
+  architecture_trainable_parameter_minimum: 15000000
+  architecture_trainable_parameter_maximum: 150000000
   score_minimum: 0.0
   score_maximum: 1.0
   campaign_duration_seconds: 72000
@@ -26,8 +29,8 @@ constraints:
 allowed_search_types: [DIRECT, OPTUNA, OPENEVOLVE]
 evaluator_id: feta-basic-unet-search-evaluator
 verifier_id: deterministic-verifier
-maximum_cycles: 96
-maximum_experiments: 140
+maximum_cycles: 128
+maximum_experiments: 120
 maximum_cost: 50.0
 requires_approval_for: []
 provenance: REAL

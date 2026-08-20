@@ -7,7 +7,11 @@ import pytest
 from auto_researcher.contracts.enums import EventType, ProvenanceKind
 from auto_researcher.contracts.models import DecisionEvent, Hypothesis, SearchRequest
 from auto_researcher.agents.mock import MockHypothesisAgent, MockPlannerAgent
-from auto_researcher.graph.nodes.provenance import _semantic_identity, record_provenance
+from auto_researcher.graph.nodes.provenance import (
+    _experiment_request_evidence_references,
+    _semantic_identity,
+    record_provenance,
+)
 from auto_researcher.provenance.sqlite_store import SQLiteProvenanceStore
 from auto_researcher.runtime.dependencies import task_memory_dependencies
 from auto_researcher.runtime.identity import payload_hash
@@ -162,6 +166,23 @@ def test_changed_search_request_with_same_identity_fails_closed():
     )
     with pytest.raises(ValueError, match="conflicting_semantic_provenance_event"):
         record_provenance(state, dependencies)
+
+
+def test_reused_experiment_does_not_inherit_current_request_tree_metadata():
+    state, _ = _domain_state()
+    request = state["search_request"].model_copy(
+        update={"evidence_references": ("tree-stage:root", "tree-action:OPENEVOLVE")}
+    )
+
+    assert _experiment_request_evidence_references(
+        request.request_id, request
+    ) == (
+        "evidence_reference:tree-stage:root",
+        "evidence_reference:tree-action:OPENEVOLVE",
+    )
+    assert _experiment_request_evidence_references(
+        "historical-optuna-request", request
+    ) == ()
 
 
 def test_hypothesis_nested_scientific_mapping_is_frozen_and_canonical():

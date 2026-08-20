@@ -16,6 +16,9 @@ from auto_researcher.contracts.enums import (
 )
 from auto_researcher.contracts.models import DecisionEvent, SearchRequest
 from auto_researcher.tasks.feta_unet_search.configuration import (
+    V6_ARCHITECTURE_BUDGET,
+    V6_BASIC_UNET_FEATURE_PROFILES,
+    V6_OPTUNA_FEATURE_PROFILES,
     FeTAUNetSearchConfiguration,
 )
 from auto_researcher.tasks.feta_unet_search.continuation import (
@@ -28,6 +31,7 @@ from auto_researcher.tasks.feta_unet_search.portfolio import (
     TreePortfolioPolicy,
     _evidence,
     _tree_candidates,
+    _tree_request_metadata,
     apply_portfolio_policy,
 )
 from auto_researcher.tasks.models import TaskRuntimeContext
@@ -36,6 +40,12 @@ from auto_researcher.tasks.models import TaskRuntimeContext
 def _options() -> dict:
     root = Path(__file__).resolve().parents[2]
     path = root / "examples/tasks/feta_unet_search/campaign-20h-template.yaml"
+    return yaml.safe_load(path.read_text())["runtime"]["options"]
+
+
+def _v6_options() -> dict:
+    root = Path(__file__).resolve().parents[2]
+    path = root / "examples/tasks/feta_unet_search/campaign-20h-v6-template.yaml"
     return yaml.safe_load(path.read_text())["runtime"]["options"]
 
 
@@ -128,6 +138,82 @@ def test_portfolio_policy_requires_exact_screening_and_promotion_shape():
     }
     assert policy.promotion_targets == {50: 8, 100: 4, 150: 2}
     assert policy.wildcard_counts == {50: 3, 100: 1, 150: 1}
+
+
+def test_v6_policy_concentrates_on_basicunet_with_broader_graduation():
+    policy = TreePortfolioPolicy.from_runtime(
+        TaskRuntimeContext(task_options=_v6_options())
+    )
+    assert policy.root_screening == {
+        SearchType.OPTUNA: 4,
+        SearchType.OPENEVOLVE: 4,
+        SearchType.DIRECT: 4,
+    }
+    assert policy.root_model_variants == {"basic_unet": 4}
+    assert policy.promotion_targets == {50: 10, 100: 5, 150: 3}
+    assert policy.wildcard_counts == {50: 3, 100: 2, 150: 1}
+    assert all(
+        FeTAUNetSearchConfiguration.model_validate(item).architecture_budget
+        == V6_ARCHITECTURE_BUDGET
+        for item in policy.direct_root_configurations
+    )
+
+
+def test_v6_starts_with_four_architecture_optuna_roots_then_reuses_oe_anchor():
+    context = TaskRuntimeContext(task_options=_v6_options())
+    first = apply_portfolio_policy(
+        _original(),
+        run_id="portfolio-run",
+        cycle=1,
+        events=(),
+        runtime_context=context,
+    )
+    assert first is not None
+    assert first.search_type == SearchType.OPTUNA
+    assert first.experiment_budget == 4
+    assert first.search_space["fixed"] == {
+        "maximum_epochs": 25,
+        "model_variant": "basic_unet",
+        "architecture_budget": V6_ARCHITECTURE_BUDGET,
+        "upsample": "deconv",
+    }
+    assert first.search_space["parameters"]["feature_width"]["choices"] == list(
+        V6_OPTUNA_FEATURE_PROFILES
+    )
+
+    events: list[DecisionEvent] = [_planned_event(1, first)]
+    profiles = tuple(V6_BASIC_UNET_FEATURE_PROFILES)[:4]
+    for index, profile in enumerate(profiles):
+        experiment_id = f"experiment-{index}"
+        configuration = FeTAUNetSearchConfiguration(
+            maximum_epochs=25,
+            model_variant="basic_unet",
+            feature_width=profile,
+            architecture_budget=V6_ARCHITECTURE_BUDGET,
+            upsample="deconv",
+            learning_rate=0.0001 + index * 0.00001,
+        ).model_dump(mode="json")
+        events.extend(
+            (
+                _prepared_event(index, first, experiment_id),
+                _event(index, SearchType.OPTUNA, configuration, 0.70 + index / 100),
+            )
+        )
+
+    second = apply_portfolio_policy(
+        _original(),
+        run_id="portfolio-run",
+        cycle=2,
+        events=tuple(events),
+        runtime_context=context,
+    )
+    assert second is not None
+    assert second.search_type == SearchType.OPENEVOLVE
+    assert second.experiment_budget == 5
+    campaign = second.search_space["campaign_context"]
+    assert campaign["required_model_variant"] == "basic_unet"
+    assert campaign["required_architecture_budget"] == V6_ARCHITECTURE_BUDGET
+    assert campaign["incumbent_experiment_id"] == "experiment-3"
 
 
 def _planned_event(index: int, request: SearchRequest) -> DecisionEvent:
@@ -538,6 +624,173 @@ def test_tree_portfolio_recovers_lineage_from_prepared_experiment_event():
     assert fourth.search_space["campaign_context"]["required_model_variant"] == (
         "basic_unet"
     )
+
+
+def test_tree_portfolio_recovers_canonical_openevolve_anchor_reuse():
+    context = TaskRuntimeContext(task_options=_v6_options())
+    optuna = apply_portfolio_policy(
+        _original(),
+        run_id="portfolio-run",
+        cycle=1,
+        events=(),
+        runtime_context=context,
+    )
+    assert optuna is not None
+    optuna_metadata = {
+        item.split(":", 1)[0]: item.split(":", 1)[1]
+        for item in optuna.evidence_references
+        if item.startswith("tree-")
+    }
+    optuna_events: list[DecisionEvent] = [_planned_event(1, optuna)]
+    for index, feature_width in enumerate(
+        tuple(V6_BASIC_UNET_FEATURE_PROFILES)[:4]
+    ):
+        configuration = FeTAUNetSearchConfiguration(
+            maximum_epochs=25,
+            model_variant="basic_unet",
+            feature_width=feature_width,
+            architecture_budget=V6_ARCHITECTURE_BUDGET,
+            upsample="deconv",
+        ).model_dump(mode="json")
+        optuna_events.extend(
+            (
+                _prepared_event(index, optuna, f"experiment-{index}"),
+                _event(index, SearchType.OPTUNA, configuration, 0.74 + index / 100),
+            )
+        )
+    experiment_id = "experiment-3"
+    openevolve = apply_portfolio_policy(
+        _original(),
+        run_id="portfolio-run",
+        cycle=2,
+        events=tuple(optuna_events),
+        runtime_context=context,
+    )
+    assert openevolve is not None
+    assert openevolve.search_type == SearchType.OPENEVOLVE
+    conflicting_prepared = _prepared_event(2, optuna, experiment_id).model_copy(
+        update={
+            "output_references": (
+                experiment_id,
+                *(
+                    f"evidence_reference:{item}"
+                    for item in openevolve.evidence_references
+                ),
+            )
+        }
+    )
+    candidate_prepared = DecisionEvent(
+        event_id="event-openevolve-anchor-prepared",
+        run_id="portfolio-run",
+        cycle=2,
+        event_type=EventType.OPENEVOLVE_CANDIDATE_PREPARED,
+        actor="openevolve_search",
+        input_references=("candidate-generation-zero",),
+        output_references=(experiment_id,),
+        rationale="reused canonical generation-zero experiment",
+        timestamp=datetime(2026, 8, 18, tzinfo=UTC),
+        code_version="test",
+        provenance=ProvenanceKind.REAL,
+    )
+    events = (
+        *tuple(optuna_events),
+        _planned_event(2, openevolve),
+        candidate_prepared,
+        conflicting_prepared,
+    )
+
+    metadata = _tree_request_metadata(events)
+
+    assert metadata[experiment_id] == optuna_metadata
+    completed_events = list(events)
+    for sample in range(1, openevolve.experiment_budget):
+        index = 10 + sample
+        mutant_id = f"experiment-{index}"
+        mutant_configuration = _sampled_configuration(
+            openevolve, sample, index
+        )
+        completed_events.extend(
+            (
+                _prepared_event(index, openevolve, mutant_id),
+                _event(
+                    index,
+                    SearchType.OPENEVOLVE,
+                    mutant_configuration,
+                    0.70 + sample / 100,
+                ),
+            )
+        )
+
+    direct = apply_portfolio_policy(
+        _original(),
+        run_id="portfolio-run",
+        cycle=3,
+        events=tuple(completed_events),
+        runtime_context=context,
+    )
+
+    assert direct is not None
+    assert direct.search_type == SearchType.DIRECT
+
+
+def test_tree_portfolio_rejects_unconfirmed_cross_method_tree_metadata():
+    context = TaskRuntimeContext(task_options=_v6_options())
+    optuna = apply_portfolio_policy(
+        _original(),
+        run_id="portfolio-run",
+        cycle=1,
+        events=(),
+        runtime_context=context,
+    )
+    assert optuna is not None
+    optuna_events: list[DecisionEvent] = [_planned_event(1, optuna)]
+    for index, feature_width in enumerate(
+        tuple(V6_BASIC_UNET_FEATURE_PROFILES)[:4]
+    ):
+        configuration = FeTAUNetSearchConfiguration(
+            maximum_epochs=25,
+            model_variant="basic_unet",
+            feature_width=feature_width,
+            architecture_budget=V6_ARCHITECTURE_BUDGET,
+            upsample="deconv",
+        ).model_dump(mode="json")
+        optuna_events.extend(
+            (
+                _prepared_event(index, optuna, f"experiment-{index}"),
+                _event(index, SearchType.OPTUNA, configuration, 0.74 + index / 100),
+            )
+        )
+    experiment_id = "experiment-3"
+    openevolve = apply_portfolio_policy(
+        _original(),
+        run_id="portfolio-run",
+        cycle=2,
+        events=tuple(optuna_events),
+        runtime_context=context,
+    )
+    assert openevolve is not None
+    conflicting_prepared = _prepared_event(2, optuna, experiment_id).model_copy(
+        update={
+            "output_references": (
+                experiment_id,
+                *(
+                    f"evidence_reference:{item}"
+                    for item in openevolve.evidence_references
+                ),
+            )
+        }
+    )
+
+    with pytest.raises(
+        ValueError, match="feta_unet_campaign_tree_metadata_conflict"
+    ):
+        _tree_request_metadata(
+            (
+                *tuple(optuna_events),
+                _planned_event(2, openevolve),
+                conflicting_prepared,
+            )
+        )
 
 
 def test_tree_portfolio_rejects_duplicate_execution_in_same_branch():

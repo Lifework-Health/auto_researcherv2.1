@@ -20,9 +20,9 @@ from auto_researcher.tasks.models import (
 )
 
 EVALUATOR_ID = "feta-basic-unet-search-evaluator"
-EVALUATOR_VERSION = "feta-unet-search-evaluator-v3"
-RESULT_ID = "feta-unet-search-result-v3"
-SCIENTIFIC_ID = "feta-unet-fold0-bounded-family-tree-search-macro-dice-v3"
+EVALUATOR_VERSION = "feta-unet-search-evaluator-v4"
+RESULT_ID = "feta-unet-search-result-v4"
+SCIENTIFIC_ID = "feta-unet-fold0-bounded-family-tree-search-macro-dice-v4"
 AUGMENTATION_ID = "feta-bounded-explicit-geometric-intensity-policies-v2"
 LOSS_ID = "bounded-dice-ce-focal-or-tversky-no-background-v3"
 OPTIMISER_ID = "adam-or-adamw-bounded-lr-wd-with-150epoch-schedules-v2"

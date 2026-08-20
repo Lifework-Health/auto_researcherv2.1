@@ -22,6 +22,9 @@ from auto_researcher.tasks.feta_unet_search.configuration import (
     LEARNING_RATE_BOUNDS,
     LOSS_VARIANTS,
     MODEL_VARIANTS,
+    V6_ARCHITECTURE_BUDGET,
+    V6_BASIC_UNET_FEATURE_PROFILES,
+    V6_OPTUNA_FEATURE_PROFILES,
     WEIGHT_DECAY_BOUNDS,
     FeTAUNetSearchConfiguration,
 )
@@ -34,6 +37,7 @@ from auto_researcher.tasks.models import TaskRuntimeContext
 
 PORTFOLIO_VERSION = "feta-unet-60-18-7-2-portfolio-v1"
 TREE_PORTFOLIO_VERSION = "feta-unet-family-lineage-tree-24-18-6-8-4-2-v3"
+V6_TREE_PORTFOLIO_VERSION = "feta-basicunet-architecture-tree-12-18-6-10-5-3-v1"
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,7 @@ class PortfolioPolicy:
 
 @dataclass(frozen=True)
 class TreePortfolioPolicy:
+    version: str
     root_screening: dict[SearchType, int]
     root_model_variants: dict[str, int]
     root_parent_count: int
@@ -131,8 +136,12 @@ class TreePortfolioPolicy:
     @classmethod
     def from_runtime(cls, context: TaskRuntimeContext) -> "TreePortfolioPolicy":
         raw = context.task_options.get("campaign_portfolio")
-        if not isinstance(raw, dict) or raw.get("version") != TREE_PORTFOLIO_VERSION:
+        if not isinstance(raw, dict) or raw.get("version") not in {
+            TREE_PORTFOLIO_VERSION,
+            V6_TREE_PORTFOLIO_VERSION,
+        }:
             raise ValueError("feta_unet_campaign_tree_portfolio_invalid")
+        version = str(raw["version"])
         try:
             roots = {
                 SearchType(name): int(value)
@@ -163,26 +172,51 @@ class TreePortfolioPolicy:
             direct = tuple(dict(item) for item in raw["direct_root_configurations"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("feta_unet_campaign_tree_portfolio_invalid") from exc
-        if (
-            roots
-            != {
-                SearchType.OPTUNA: 8,
-                SearchType.OPENEVOLVE: 8,
-                SearchType.DIRECT: 8,
+        expected = (
+            {
+                "roots": {
+                    SearchType.OPTUNA: 8,
+                    SearchType.OPENEVOLVE: 8,
+                    SearchType.DIRECT: 8,
+                },
+                "root_parent_count": 6,
+                "root_model_variants": {
+                    "basic_unet": 4,
+                    "unet_plain": 2,
+                    "unet_residual": 2,
+                },
+                "child_parent_count": 3,
+                "promotions": {50: 8, 100: 4, 150: 2},
+                "wildcards": {50: 3, 100: 1, 150: 1},
             }
-            or root_parent_count != 6
-            or root_model_variants
-            != {"basic_unet": 4, "unet_plain": 2, "unet_residual": 2}
+            if version == TREE_PORTFOLIO_VERSION
+            else {
+                "roots": {
+                    SearchType.OPTUNA: 4,
+                    SearchType.OPENEVOLVE: 4,
+                    SearchType.DIRECT: 4,
+                },
+                "root_parent_count": 6,
+                "root_model_variants": {"basic_unet": 4},
+                "child_parent_count": 3,
+                "promotions": {50: 10, 100: 5, 150: 3},
+                "wildcards": {50: 3, 100: 2, 150: 1},
+            }
+        )
+        if (
+            roots != expected["roots"]
+            or root_parent_count != expected["root_parent_count"]
+            or root_model_variants != expected["root_model_variants"]
             or children
             != {
                 SearchType.OPTUNA: 1,
                 SearchType.OPENEVOLVE: 1,
                 SearchType.DIRECT: 1,
             }
-            or child_parent_count != 3
+            or child_parent_count != expected["child_parent_count"]
             or grandchildren != {SearchType.OPTUNA: 1, SearchType.OPENEVOLVE: 1}
-            or promotions != {50: 8, 100: 4, 150: 2}
-            or wildcards != {50: 3, 100: 1, 150: 1}
+            or promotions != expected["promotions"]
+            or wildcards != expected["wildcards"]
             or len(direct) < roots[SearchType.DIRECT]
         ):
             raise ValueError("feta_unet_campaign_tree_portfolio_invalid")
@@ -203,6 +237,7 @@ class TreePortfolioPolicy:
                 }
             )
         return cls(
+            version=version,
             root_screening=roots,
             root_model_variants=root_model_variants,
             root_parent_count=root_parent_count,
@@ -451,6 +486,12 @@ def _tree_request_metadata(
             requests[request_id] = metadata
         elif event.rationale.startswith(f"{TREE_PORTFOLIO_VERSION}:"):
             missing_requests.add(request_id)
+    openevolve_prepared_experiments = {
+        event.output_references[0]
+        for event in events
+        if event.event_type == EventType.OPENEVOLVE_CANDIDATE_PREPARED
+        and event.output_references
+    }
     experiments: dict[str, dict[str, str]] = {}
     for event in events:
         if (
@@ -466,8 +507,30 @@ def _tree_request_metadata(
             and embedded_metadata
             and request_metadata != embedded_metadata
         ):
-            raise ValueError("feta_unet_campaign_tree_metadata_conflict")
-        metadata = embedded_metadata or request_metadata
+            experiment_id = event.output_references[0]
+            matching_reuse_requests = tuple(
+                request_id
+                for request_id, metadata in requests.items()
+                if metadata == embedded_metadata
+            )
+            canonical_openevolve_reuse = (
+                experiment_id in openevolve_prepared_experiments
+                and request_metadata.get("tree-action")
+                != SearchType.OPENEVOLVE.value
+                and embedded_metadata.get("tree-action")
+                == SearchType.OPENEVOLVE.value
+                and len(matching_reuse_requests) == 1
+            )
+            if not canonical_openevolve_reuse:
+                raise ValueError("feta_unet_campaign_tree_metadata_conflict")
+            # This is a legacy provenance shape produced when OpenEvolve reused
+            # a canonical generation-zero experiment.  Keep the experiment's
+            # original method ownership, while marking the OpenEvolve request
+            # as consumed by the explicitly recorded reuse operation.
+            missing_requests.discard(matching_reuse_requests[0])
+            metadata = request_metadata
+        else:
+            metadata = embedded_metadata or request_metadata
         if metadata is not None:
             experiments[event.output_references[0]] = metadata
             missing_requests.discard(event.input_references[0])
@@ -628,6 +691,9 @@ def _local_optuna_space(
                 for name in (
                     "model_variant",
                     "feature_width",
+                    "features",
+                    "architecture_budget",
+                    "upsample",
                     "activation",
                     "norm",
                     "optimizer",
@@ -659,16 +725,26 @@ def _local_optuna_space(
     }
 
 
-def _direct_ablation(parent: CandidateEvidence, existing: set[str]) -> dict[str, Any]:
+def _direct_ablation(
+    parent: CandidateEvidence,
+    existing: set[str],
+    *,
+    allowed_model_variants: tuple[str, ...] = MODEL_VARIANTS,
+) -> dict[str, Any]:
     base = {name: parent.configuration[name] for name in CANDIDATE_CONFIGURATION_FIELDS}
+    feature_widths = (
+        tuple(V6_BASIC_UNET_FEATURE_PROFILES)
+        if base.get("architecture_budget") == V6_ARCHITECTURE_BUDGET
+        else ("narrow", "baseline", "wide")
+    )
     axes: tuple[tuple[str, tuple[Any, ...]], ...] = (
-        ("model_variant", MODEL_VARIANTS),
+        ("model_variant", allowed_model_variants),
         ("lr_schedule", ("constant", "cosine", "polynomial")),
         ("optimizer", ("AdamW", "Adam")),
         ("loss_variant", LOSS_VARIANTS),
         ("norm", ("instance", "group")),
         ("activation", ("LeakyReLU", "ReLU", "PReLU")),
-        ("feature_width", ("narrow", "baseline", "wide")),
+        ("feature_width", feature_widths),
         ("augmentation_policy", AUGMENTATION_POLICIES),
     )
     for name, values in axes:
@@ -676,6 +752,8 @@ def _direct_ablation(parent: CandidateEvidence, existing: set[str]) -> dict[str,
             if value == base[name]:
                 continue
             candidate = {**base, name: value, "maximum_epochs": 25}
+            if name == "feature_width":
+                candidate.pop("features", None)
             validated = FeTAUNetSearchConfiguration.model_validate(candidate)
             if trajectory_identity(validated) not in existing:
                 return {
@@ -727,6 +805,18 @@ def apply_tree_portfolio_policy(
         if len(completed) >= target:
             continue
         remaining = target - len(completed)
+        v6_architecture = policy.version == V6_TREE_PORTFOLIO_VERSION
+        fixed = {
+            "maximum_epochs": 25,
+            "model_variant": model_variant,
+        }
+        parameters: dict[str, Any] = {}
+        if v6_architecture:
+            fixed["architecture_budget"] = V6_ARCHITECTURE_BUDGET
+            fixed["upsample"] = "deconv"
+            parameters["feature_width"] = {
+                "choices": list(V6_OPTUNA_FEATURE_PROFILES)
+            }
         return _request(
             original,
             run_id=run_id,
@@ -737,10 +827,8 @@ def apply_tree_portfolio_policy(
                 "seed": _tree_seed(
                     f"{run_id}:root:{model_variant}", SearchType.OPTUNA, 0
                 ),
-                "fixed": {
-                    "maximum_epochs": 25,
-                    "model_variant": model_variant,
-                }
+                "fixed": fixed,
+                **({"parameters": parameters} if parameters else {}),
             },
             experiment_budget=remaining,
             rationale=(
@@ -788,7 +876,13 @@ def apply_tree_portfolio_policy(
             ).model_dump(mode="json"),
             "incumbent_primary_score": parent.evidence.best_score,
             "incumbent_search_type": parent.action.value,
+            "incumbent_experiment_id": parent.evidence.experiment_id,
             "required_model_variant": model_variant,
+            **(
+                {"required_architecture_budget": V6_ARCHITECTURE_BUDGET}
+                if policy.version == V6_TREE_PORTFOLIO_VERSION
+                else {}
+            ),
             "prior_verified_results": [
                 {
                     "search_type": item.action.value,
@@ -935,6 +1029,15 @@ def apply_tree_portfolio_policy(
                     ).model_dump(mode="json"),
                     "incumbent_primary_score": parent.evidence.best_score,
                     "incumbent_search_type": parent.action.value,
+                    "incumbent_experiment_id": parent.evidence.experiment_id,
+                    "required_model_variant": parent.evidence.configuration[
+                        "model_variant"
+                    ],
+                    **(
+                        {"required_architecture_budget": V6_ARCHITECTURE_BUDGET}
+                        if policy.version == V6_TREE_PORTFOLIO_VERSION
+                        else {}
+                    ),
                     "prior_verified_results": [
                         {
                             "search_type": parent.action.value,
@@ -956,7 +1059,11 @@ def apply_tree_portfolio_policy(
                     ),
                     evidence_references=references,
                 )
-            configuration = _direct_ablation(parent.evidence, existing_25)
+            configuration = _direct_ablation(
+                parent.evidence,
+                existing_25,
+                allowed_model_variants=tuple(policy.root_model_variants),
+            )
             return _request(
                 original,
                 run_id=run_id,
@@ -1039,6 +1146,15 @@ def apply_tree_portfolio_policy(
                 ).model_dump(mode="json"),
                 "incumbent_primary_score": parent.evidence.best_score,
                 "incumbent_search_type": parent.action.value,
+                "incumbent_experiment_id": parent.evidence.experiment_id,
+                "required_model_variant": parent.evidence.configuration[
+                    "model_variant"
+                ],
+                **(
+                    {"required_architecture_budget": V6_ARCHITECTURE_BUDGET}
+                    if policy.version == V6_TREE_PORTFOLIO_VERSION
+                    else {}
+                ),
                 "prior_verified_results": [
                     {
                         "search_type": parent.action.value,
@@ -1124,7 +1240,8 @@ def apply_portfolio_policy(
     raw_policy = runtime_context.task_options.get("campaign_portfolio")
     if (
         isinstance(raw_policy, dict)
-        and raw_policy.get("version") == TREE_PORTFOLIO_VERSION
+        and raw_policy.get("version")
+        in {TREE_PORTFOLIO_VERSION, V6_TREE_PORTFOLIO_VERSION}
     ):
         return apply_tree_portfolio_policy(
             original,
@@ -1199,6 +1316,7 @@ def apply_portfolio_policy(
             ).model_dump(mode="json"),
             "incumbent_primary_score": incumbent.rung_score,
             "incumbent_search_type": incumbent.search_type.value,
+            "incumbent_experiment_id": incumbent.experiment_id,
             "prior_verified_results": [
                 {
                     "search_type": item.search_type.value,

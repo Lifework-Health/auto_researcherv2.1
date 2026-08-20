@@ -38,6 +38,7 @@ class DirectSearchBackend:
     ) -> ExperimentSpec:
         if request.search_type != SearchType.DIRECT:
             raise ValueError("DirectSearchBackend accepts only DIRECT requests")
+        raw_configuration: dict[str, JsonValue] = dict(request.search_space)
         configuration: dict[str, JsonValue] = {}
         for name in sorted(request.search_space):
             values = request.search_space[name]
@@ -46,7 +47,20 @@ class DirectSearchBackend:
                 if isinstance(values, list)
                 else values
             )
-        configuration = self.normalise_configuration(configuration)
+        try:
+            configuration = self.normalise_configuration(configuration)
+        except (TypeError, ValueError) as selected_value_error:
+            # DIRECT historically accepts a one-item JSON list as a scalar
+            # choice. Some task-owned scientific configurations also contain
+            # atomic vectors, which become JSON lists after checkpoint replay.
+            # Preserve the old selection rule first, then permit the intact
+            # structure only when the task's strict normaliser validates it.
+            if not any(isinstance(value, list) for value in raw_configuration.values()):
+                raise
+            try:
+                configuration = self.normalise_configuration(raw_configuration)
+            except (TypeError, ValueError):
+                raise selected_value_error
         digest = hashlib.sha256(f"{run_id}\x1f{request.request_id}".encode()).hexdigest()[:16]
         return ExperimentSpec(
             experiment_id=f"experiment-{digest}",

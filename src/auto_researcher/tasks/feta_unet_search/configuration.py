@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-CONFIGURATION_SCHEMA_VERSION = "feta-unet-search-configuration-v3"
+CONFIGURATION_SCHEMA_VERSION = "feta-unet-search-configuration-v4"
 FIDELITY_LEVELS = (5, 25, 50, 100, 150)
 LEARNING_RATE_BOUNDS = (3e-5, 5e-4)
 WEIGHT_DECAY_BOUNDS = (1e-6, 3e-4)
@@ -25,6 +25,43 @@ FEATURE_WIDTH_PROFILES = {
     "baseline": (32, 32, 64, 128, 256, 32),
     "wide": (40, 40, 80, 160, 320, 40),
 }
+V6_BASIC_UNET_FEATURE_PROFILES = {
+    "v6_balanced_64": (64, 64, 128, 256, 512, 64),
+    "v6_balanced_80": (80, 80, 160, 320, 640, 80),
+    "v6_balanced_96": (96, 96, 192, 384, 768, 96),
+    "v6_balanced_112": (112, 112, 224, 448, 896, 112),
+    "v6_balanced_128": (128, 128, 256, 512, 1024, 128),
+    "v6_balanced_144": (144, 144, 288, 576, 1152, 144),
+    "v6_deep_64": (48, 64, 128, 320, 640, 64),
+    "v6_deep_80": (48, 80, 160, 400, 800, 80),
+    "v6_decoder_96": (96, 96, 160, 256, 512, 128),
+}
+ALL_FEATURE_WIDTH_PROFILES = {
+    **FEATURE_WIDTH_PROFILES,
+    **V6_BASIC_UNET_FEATURE_PROFILES,
+}
+V6_ARCHITECTURE_BUDGET = "basicunet-15m-150m-v1"
+V6_MINIMUM_TRAINABLE_PARAMETERS = 15_000_000
+V6_MAXIMUM_TRAINABLE_PARAMETERS = 150_000_000
+V6_UPSAMPLE_MODES = ("deconv", "pixelshuffle", "nontrainable")
+V6_PIXELSHUFFLE_FEATURE_PROFILES = frozenset(
+    {
+        "v6_balanced_64",
+        "v6_balanced_80",
+        "v6_balanced_96",
+        "v6_deep_64",
+        "v6_deep_80",
+        "v6_decoder_96",
+    }
+)
+V6_OPTUNA_FEATURE_PROFILES = (
+    "v6_balanced_64",
+    "v6_balanced_80",
+    "v6_balanced_96",
+    "v6_deep_64",
+    "v6_deep_80",
+    "v6_decoder_96",
+)
 RESIDUAL_CHANNEL_PROFILES = {
     "narrow": (24, 48, 96, 192, 384),
     "baseline": (32, 64, 128, 256, 512),
@@ -41,11 +78,14 @@ AUGMENTATION_POLICIES = (
     "intensity",
     "combined",
 )
-SEARCH_ARCHITECTURE_FAMILY_ID = "monai-unet-3d-bounded-family-v3"
+SEARCH_ARCHITECTURE_FAMILY_ID = "monai-unet-3d-bounded-family-v4"
 CANDIDATE_CONFIGURATION_FIELDS = (
     "maximum_epochs",
     "model_variant",
     "feature_width",
+    "features",
+    "architecture_budget",
+    "upsample",
     "activation",
     "norm",
     "optimizer",
@@ -72,7 +112,7 @@ class FeTAUNetSearchConfiguration(BaseModel):
     model_variant: Literal["basic_unet", "unet_plain", "unet_residual"] = "basic_unet"
     network_family: Literal["BasicUNet", "UNet"] = "BasicUNet"
     residual_units: Literal[0, 2] = 0
-    feature_width: Literal["narrow", "baseline", "wide"] = "baseline"
+    feature_width: str = "baseline"
     features: tuple[int, int, int, int, int, int] = FEATURE_WIDTH_PROFILES["baseline"]
     channels: tuple[int, int, int, int, int] = RESIDUAL_CHANNEL_PROFILES["baseline"]
     strides: tuple[int, int, int, int] = (2, 2, 2, 2)
@@ -82,7 +122,8 @@ class FeTAUNetSearchConfiguration(BaseModel):
     norm: Literal["instance", "group"] = "instance"
     norm_affine: Literal[True] = True
     norm_num_groups: Literal[8] = 8
-    upsample: Literal["deconv"] = "deconv"
+    architecture_budget: Literal["legacy", "basicunet-15m-150m-v1"] = "legacy"
+    upsample: Literal["deconv", "pixelshuffle", "nontrainable"] = "deconv"
     spacing_mm: tuple[float, float, float] = (0.5, 0.5, 0.5)
     patch_size: tuple[int, int, int] = (128, 128, 128)
     batch_size: Literal[1] = 1
@@ -125,8 +166,18 @@ class FeTAUNetSearchConfiguration(BaseModel):
         if not isinstance(value, dict):
             return value
         payload = dict(value)
+        profile = payload.get("feature_width")
+        if (
+            payload.get("architecture_budget") == V6_ARCHITECTURE_BUDGET
+            and profile is None
+        ):
+            profile = "v6_balanced_64"
+            payload["feature_width"] = profile
+        if profile in V6_BASIC_UNET_FEATURE_PROFILES or profile == "custom":
+            payload.setdefault("architecture_budget", V6_ARCHITECTURE_BUDGET)
+            payload.setdefault("model_variant", "basic_unet")
         profile = payload.get("feature_width", "baseline")
-        expected = FEATURE_WIDTH_PROFILES.get(profile)
+        expected = ALL_FEATURE_WIDTH_PROFILES.get(profile)
         if expected is not None and "features" not in payload:
             payload["features"] = expected
         channels = RESIDUAL_CHANNEL_PROFILES.get(profile)
@@ -159,6 +210,13 @@ class FeTAUNetSearchConfiguration(BaseModel):
     def dice_weight_is_bounded(cls, value: float) -> float:
         return cls._bounded(value, DICE_WEIGHT_BOUNDS, "dice_weight")
 
+    @field_validator("feature_width")
+    @classmethod
+    def feature_width_is_registered(cls, value: str) -> str:
+        if value != "custom" and value not in ALL_FEATURE_WIDTH_PROFILES:
+            raise ValueError("feta_unet_search_feature_width_unregistered")
+        return value
+
     @staticmethod
     def _bounded(value: float, bounds: tuple[float, float], name: str) -> float:
         result = float(value)
@@ -171,9 +229,35 @@ class FeTAUNetSearchConfiguration(BaseModel):
         # Deliberately do not call the frozen DIRECT validator: this sibling
         # task varies only the registered architecture/training surface while
         # retaining the preprocessing, fold and inference identities.
+        expected_features = ALL_FEATURE_WIDTH_PROFILES.get(self.feature_width)
+        legacy_architecture = self.architecture_budget == "legacy"
+        if legacy_architecture and (
+            self.feature_width not in FEATURE_WIDTH_PROFILES
+            or self.features != expected_features
+            or self.upsample != "deconv"
+        ):
+            raise ValueError("feta_unet_search_fixed_context_modified")
+        if not legacy_architecture and (
+            self.model_variant != "basic_unet"
+            or self.feature_width not in {*V6_BASIC_UNET_FEATURE_PROFILES, "custom"}
+            or (expected_features is not None and self.features != expected_features)
+            or any(channel % 8 or channel < 32 or channel > 1_280 for channel in self.features)
+            or tuple(sorted(self.features[:5])) != self.features[:5]
+            or not 32 <= self.features[5] <= 256
+            or self.upsample not in V6_UPSAMPLE_MODES
+            or (
+                self.upsample == "pixelshuffle"
+                and self.feature_width != "custom"
+                and self.feature_width not in V6_PIXELSHUFFLE_FEATURE_PROFILES
+            )
+        ):
+            raise ValueError("feta_unet_search_v6_architecture_invalid")
+        expected_channels = RESIDUAL_CHANNEL_PROFILES.get(self.feature_width)
         if (
-            self.features != FEATURE_WIDTH_PROFILES[self.feature_width]
-            or self.channels != RESIDUAL_CHANNEL_PROFILES[self.feature_width]
+            (
+                self.model_variant != "basic_unet"
+                and self.channels != expected_channels
+            )
             or (self.network_family, self.residual_units)
             != MODEL_VARIANT_CONTEXT[self.model_variant]
             or self.strides != (2, 2, 2, 2)

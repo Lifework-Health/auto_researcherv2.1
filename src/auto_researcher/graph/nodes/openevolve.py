@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from auto_researcher.contracts.enums import EventType
-from auto_researcher.contracts.models import EvaluationResult, VerificationResult
+from auto_researcher.contracts.models import (
+    EvaluationResult,
+    ExperimentSpec,
+    VerificationResult,
+)
 from auto_researcher.graph.nodes.provenance import record_provenance
 from auto_researcher.graph.state import ResearchState
 from auto_researcher.runtime.dependencies import RuntimeDependencies
@@ -45,6 +49,50 @@ def _replace_candidate(
         for item in collection.candidates
     )
     return OpenEvolveCandidateCollection(candidates=candidates)
+
+
+def _canonical_generation_zero_experiment(
+    state: ResearchState,
+    dependencies: RuntimeDependencies,
+    candidate: OpenEvolveCandidate,
+    proposed: ExperimentSpec,
+) -> ExperimentSpec:
+    """Reuse the exact published incumbent bundle across search methods."""
+
+    if candidate.generation != 0:
+        return proposed
+    record = dependencies.provenance_store.get_evaluation_reuse(
+        state["run_id"], proposed.experiment_id
+    )
+    if record is None:
+        return proposed
+
+    from auto_researcher.graph.nodes.evaluate import _published_payload
+
+    published = _published_payload(
+        dependencies,
+        record.expected_artefact_references,
+        "experiment_spec.json",
+        ExperimentSpec,
+    )
+    if payload_hash(published) != record.experiment_payload_hash:
+        raise ValueError("openevolve_incumbent_experiment_identity_conflict")
+    proposed_configuration = dependencies.task.normalise_configuration(
+        dict(proposed.configuration)
+    )
+    published_configuration = dependencies.task.normalise_configuration(
+        dict(published.configuration)
+    )
+    if proposed_configuration != published_configuration:
+        raise ValueError("openevolve_incumbent_configuration_conflict")
+    if (
+        proposed.evaluator_id != published.evaluator_id
+        or proposed.code_version != published.code_version
+        or proposed.dataset_version != published.dataset_version
+        or proposed.provenance != published.provenance
+    ):
+        raise ValueError("openevolve_incumbent_metadata_conflict")
+    return published
 
 
 def _event(
@@ -297,6 +345,12 @@ def prepare_openevolve_candidate(
                 state["contract"],
                 dependencies.experiment_metadata,
                 run_id=state["run_id"],
+            )
+            experiment = _canonical_generation_zero_experiment(
+                state,
+                dependencies,
+                candidate,
+                experiment,
             )
             if (
                 experiment.evaluator_id != dependencies.experiment_metadata.evaluator_id

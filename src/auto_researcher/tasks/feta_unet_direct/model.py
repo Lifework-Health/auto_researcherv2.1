@@ -43,7 +43,7 @@ def architecture_identity(configuration: FeTAUNetDirectConfiguration) -> str:
     ):
         return ARCHITECTURE_ID
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return f"monai-unet-3d-bounded-v3-{hashlib.sha256(encoded).hexdigest()[:16]}"
+    return f"monai-unet-3d-bounded-v4-{hashlib.sha256(encoded).hexdigest()[:16]}"
 
 
 def _activation(configuration: FeTAUNetDirectConfiguration):

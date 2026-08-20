@@ -8,6 +8,9 @@ from auto_researcher.tasks.feta_unet_direct.verification import (
 from auto_researcher.tasks.feta_unet_direct.model import architecture_identity
 from auto_researcher.tasks.feta_unet_direct.runner import SEARCH_DATA_LOADER_ID
 from auto_researcher.tasks.feta_unet_search.configuration import (
+    V6_ARCHITECTURE_BUDGET,
+    V6_MAXIMUM_TRAINABLE_PARAMETERS,
+    V6_MINIMUM_TRAINABLE_PARAMETERS,
     FeTAUNetSearchConfiguration,
 )
 from auto_researcher.tasks.feta_unet_search.evaluator import (
@@ -21,7 +24,7 @@ from auto_researcher.tasks.models import PolicyDecision
 
 
 class FeTAUNetSearchVerificationPolicy(FeTAUNetDirectVerificationPolicy):
-    policy_id = "feta-basic-unet-search-evidence-policy-v1"
+    policy_id = "feta-basic-unet-search-evidence-policy-v2"
     data_loader_identity = SEARCH_DATA_LOADER_ID
 
     def __init__(self) -> None:
@@ -44,6 +47,12 @@ class FeTAUNetSearchVerificationPolicy(FeTAUNetDirectVerificationPolicy):
             not isinstance(parameter_count, bool)
             and isinstance(parameter_count, int)
             and parameter_count > 0
+            and (
+                configuration.architecture_budget != V6_ARCHITECTURE_BUDGET
+                or V6_MINIMUM_TRAINABLE_PARAMETERS
+                <= parameter_count
+                <= V6_MAXIMUM_TRAINABLE_PARAMETERS
+            )
             and evaluation.metrics.get("architecture_identity")
             == architecture_identity(configuration)
         )

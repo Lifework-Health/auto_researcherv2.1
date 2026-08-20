@@ -84,7 +84,7 @@ FoldExecutor = Callable[
 ]
 
 MAX_CONSECUTIVE_AMP_SKIPS = 16
-SEARCH_RUNNER_ID = "feta-unet-family-fold0-development-runner-v3"
+SEARCH_RUNNER_ID = "feta-unet-family-fold0-development-runner-v4"
 SEARCH_DATA_LOADER_ID = "monai-unet-family-explicit-augmentation-loader-v4"
 
 
@@ -223,9 +223,24 @@ def _run_cuda_fold(
     seed = seed_everything(fold)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    model = create_unet_model(configuration).to("cuda")
+    model = create_unet_model(configuration)
     candidate_architecture_identity = architecture_identity(configuration)
     candidate_trainable_parameters = trainable_parameter_count(model)
+    if getattr(configuration, "architecture_budget", "legacy") != "legacy":
+        from auto_researcher.tasks.feta_unet_search.configuration import (
+            V6_ARCHITECTURE_BUDGET,
+            V6_MAXIMUM_TRAINABLE_PARAMETERS,
+            V6_MINIMUM_TRAINABLE_PARAMETERS,
+        )
+
+        if (
+            configuration.architecture_budget != V6_ARCHITECTURE_BUDGET
+            or not V6_MINIMUM_TRAINABLE_PARAMETERS
+            <= candidate_trainable_parameters
+            <= V6_MAXIMUM_TRAINABLE_PARAMETERS
+        ):
+            raise ValueError("feta_unet_architecture_parameter_budget_out_of_bounds")
+    model = model.to("cuda")
     loss_function = create_loss(configuration)
     optimizer = create_optimizer(model, configuration)
     scheduler = create_scheduler(optimizer, configuration)

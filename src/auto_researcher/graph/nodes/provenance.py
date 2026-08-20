@@ -18,6 +18,26 @@ CODE_VERSION = "auto-researcher-v2.1-pr5.3"
 PROVENANCE_SEMANTIC_VERSION = "provenance-events-v2"
 
 
+def _experiment_request_evidence_references(
+    experiment_search_request_id: str,
+    request: Any | None,
+) -> tuple[str, ...]:
+    """Return tree metadata only when the request owns the experiment.
+
+    OpenEvolve may reuse a canonical generation-zero experiment that was
+    originally prepared by another search method.  In that case the current
+    request describes the reuse operation, not the historical experiment, and
+    its lineage annotations must not be attached to the experiment event.
+    """
+
+    if request is None or request.request_id != experiment_search_request_id:
+        return ()
+    return tuple(
+        f"evidence_reference:{reference}"
+        for reference in request.evidence_references
+    )
+
+
 def _semantic_identity(
     event_type: EventType,
     state: ResearchState,
@@ -193,24 +213,39 @@ def record_provenance(
             )
         )
     if experiment:
-        search_type = request.search_type.value if request else "DIRECT"
+        reused_experiment = (
+            request is not None
+            and request.request_id != experiment.search_request_id
+        )
+        search_type = (
+            "HISTORICAL"
+            if reused_experiment
+            else request.search_type.value if request else "DIRECT"
+        )
         rows.append(
             (
                 EventType.EXPERIMENT_PREPARED,
-                f"{search_type.lower()}_search",
+                (
+                    "canonical_experiment_reuse"
+                    if reused_experiment
+                    else f"{search_type.lower()}_search"
+                ),
                 (experiment.search_request_id,),
                 (
                     experiment.experiment_id,
-                    *(
-                        f"evidence_reference:{reference}"
-                        for reference in (
-                            request.evidence_references if request else ()
-                        )
+                    *_experiment_request_evidence_references(
+                        experiment.search_request_id,
+                        request,
                     ),
                 ),
                 (
-                    "Prepared one task-owned experiment without evaluating it; "
-                    f"the selected generic backend was {search_type}."
+                    "Reused one canonical task-owned experiment without "
+                    "changing its original search lineage."
+                    if reused_experiment
+                    else (
+                        "Prepared one task-owned experiment without evaluating it; "
+                        f"the selected generic backend was {search_type}."
+                    )
                 ),
                 experiment.provenance,
             )

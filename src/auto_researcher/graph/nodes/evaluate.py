@@ -181,7 +181,34 @@ def evaluate_experiment(
 ) -> dict:
     experiment = state["experiment_spec"]
     assert experiment is not None
-    identity_hash, experiment_hash = _evaluation_identity(state, dependencies)
+    request = state.get("search_request")
+    candidate = state.get("openevolve_current_candidate")
+    if (
+        request is not None
+        and request.search_type == SearchType.OPENEVOLVE
+        and candidate is not None
+        and candidate.generation == 0
+    ):
+        # Also canonicalise at the evaluator boundary so a run interrupted
+        # between preparation and evaluation can resume safely after an upgrade.
+        from auto_researcher.graph.nodes.openevolve import (
+            _canonical_generation_zero_experiment,
+        )
+
+        experiment = _canonical_generation_zero_experiment(
+            state,
+            dependencies,
+            candidate,
+            experiment,
+        )
+    identity_state = (
+        state
+        if experiment is state["experiment_spec"]
+        else {**state, "experiment_spec": experiment}
+    )
+    identity_hash, experiment_hash = _evaluation_identity(
+        identity_state, dependencies
+    )
     evaluator_version = _evaluator_version(dependencies)
     existing = dependencies.provenance_store.get_evaluation_reuse(
         state["run_id"],
@@ -304,7 +331,6 @@ def evaluate_experiment(
             )
     cost = float(getattr(dependencies.evaluator, "cost_per_experiment", 0.0))
     budget = state["budget"].record_experiment(cost)
-    request = state.get("search_request")
     is_optuna = request is not None and request.search_type == SearchType.OPTUNA
     continue_after_failed_candidate = (
         dependencies.runtime_context.task_options.get(
@@ -320,7 +346,7 @@ def evaluate_experiment(
         if result.success or is_optuna or continue_after_failed_candidate
         else [result.error or "evaluation_failed"]
     )
-    return {
+    update = {
         "evaluation_result": result,
         "optuna_trial_pruned": False,
         "optuna_trial_operational_terminal": False,
@@ -331,3 +357,6 @@ def evaluate_experiment(
             "evaluate_experiment_reused" if reused else "evaluate_experiment"
         ],
     }
+    if experiment is not state["experiment_spec"]:
+        update["experiment_spec"] = experiment
+    return update

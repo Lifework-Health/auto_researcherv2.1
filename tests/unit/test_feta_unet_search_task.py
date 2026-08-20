@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -19,11 +20,17 @@ from auto_researcher.contracts.models import (
     BudgetState,
     DecisionEvent,
     EvaluationResult,
+    ExperimentSpec,
     ResearchContract,
     SearchRequest,
 )
+from auto_researcher.graph.nodes.openevolve import (
+    _canonical_generation_zero_experiment,
+)
 from auto_researcher.provenance.sqlite_store import SQLiteProvenanceStore
 from auto_researcher.runtime.dependencies import task_memory_dependencies
+from auto_researcher.runtime.identity import payload_hash
+from auto_researcher.search.direct import DirectSearchBackend
 from auto_researcher.search.openevolve.backend import OpenEvolveBackend
 from auto_researcher.search.openevolve.mutation import DeterministicMutationOperator
 from auto_researcher.search.openevolve.models import CandidateOutcome, CandidateStatus
@@ -45,6 +52,11 @@ from auto_researcher.tasks.feta_unet_search import (
     FeTAUNetSearchConfiguration,
     FeTAUNetSearchTask,
     default_feta_unet_search_contract,
+)
+from auto_researcher.tasks.feta_unet_search.configuration import (
+    CANDIDATE_CONFIGURATION_FIELDS,
+    V6_ARCHITECTURE_BUDGET,
+    V6_BASIC_UNET_FEATURE_PROFILES,
 )
 from auto_researcher.tasks.feta_unet_search.evaluator import (
     AUGMENTATION_ID,
@@ -187,7 +199,61 @@ def test_agent_context_exposes_direct_executable_parameter_names():
         "positive_negative_ratio",
         "augmentation_policy",
         "model_variant",
+        "architecture_budget",
+        "upsample",
     }
+
+
+def test_v6_basicunet_architecture_genome_is_bounded_and_contract_validates():
+    configuration = FeTAUNetSearchConfiguration(
+        maximum_epochs=25,
+        model_variant="basic_unet",
+        feature_width="custom",
+        features=(64, 80, 160, 320, 640, 96),
+        architecture_budget=V6_ARCHITECTURE_BUDGET,
+        upsample="pixelshuffle",
+    )
+    assert configuration.features == (64, 80, 160, 320, 640, 96)
+
+    derived = FeTAUNetSearchConfiguration(
+        maximum_epochs=25,
+        architecture_budget=V6_ARCHITECTURE_BUDGET,
+    )
+    assert derived.feature_width == "v6_balanced_64"
+    assert derived.features == (64, 64, 128, 256, 512, 64)
+
+    with pytest.raises(ValidationError, match="v6_architecture_invalid"):
+        FeTAUNetSearchConfiguration(
+            maximum_epochs=25,
+            model_variant="unet_residual",
+            feature_width="custom",
+            features=(64, 80, 160, 320, 640, 96),
+            architecture_budget=V6_ARCHITECTURE_BUDGET,
+        )
+    with pytest.raises(ValidationError, match="v6_architecture_invalid"):
+        FeTAUNetSearchConfiguration(
+            maximum_epochs=25,
+            model_variant="basic_unet",
+            feature_width="custom",
+            features=(64, 80, 72, 320, 640, 96),
+            architecture_budget=V6_ARCHITECTURE_BUDGET,
+        )
+
+    root = Path(__file__).resolve().parents[2]
+    contract = ResearchContract.model_validate(
+        yaml.safe_load(
+            (root / "examples/tasks/feta_unet_search/contract-20h-v6.yaml").read_text()
+        )
+    )
+    FeTAUNetSearchTask().validate_contract(contract)
+    context = FeTAUNetSearchTask().create_agent_context(contract, _runtime(), {})
+    assert context.direct_configuration_schema["maximum_epochs"] == [25]
+    assert context.direct_configuration_schema["model_variant"] == ["basic_unet"]
+    assert context.direct_configuration_schema["architecture_budget"] == [
+        V6_ARCHITECTURE_BUDGET
+    ]
+    assert context.direct_configuration_schema["upsample"] == ["deconv"]
+    assert "features" not in context.direct_configuration_schema
 
 
 def test_one_runtime_assembly_exposes_all_three_backends():
@@ -364,6 +430,164 @@ def test_optuna_fixed_residual_family_recomputes_derived_architecture():
     assert candidate.channels == (40, 80, 160, 320, 640)
 
 
+def test_v6_portfolio_optuna_root_registers_architecture_context():
+    task = FeTAUNetSearchTask()
+    specification = task.create_optuna_study_spec(
+        default_feta_unet_search_contract(),
+        _request(
+            SearchType.OPTUNA,
+            {
+                "fixed": {
+                    "maximum_epochs": 25,
+                    "model_variant": "basic_unet",
+                    "architecture_budget": V6_ARCHITECTURE_BUDGET,
+                    "upsample": "deconv",
+                },
+                "parameters": {
+                    "feature_width": {
+                        "choices": [
+                            "v6_balanced_64",
+                            "v6_balanced_80",
+                            "v6_balanced_96",
+                            "v6_deep_64",
+                            "v6_deep_80",
+                            "v6_decoder_96",
+                        ]
+                    }
+                },
+            },
+            budget=4,
+        ),
+    )
+    assert specification.trial_budget == 4
+    assert specification.fixed_configuration["maximum_epochs"] == 25
+    assert (
+        specification.fixed_configuration["architecture_budget"]
+        == V6_ARCHITECTURE_BUDGET
+    )
+    assert specification.fixed_configuration["upsample"] == "deconv"
+    assert specification.fixed_configuration["model_variant"] == "basic_unet"
+    feature_width = next(
+        item for item in specification.parameters if item.name == "feature_width"
+    )
+    assert feature_width.choices == (
+        "v6_balanced_64",
+        "v6_balanced_80",
+        "v6_balanced_96",
+        "v6_deep_64",
+        "v6_deep_80",
+        "v6_decoder_96",
+    )
+
+
+def test_v6_direct_replay_preserves_registered_feature_vector():
+    task = FeTAUNetSearchTask()
+    configuration = FeTAUNetSearchConfiguration(
+        maximum_epochs=25,
+        model_variant="basic_unet",
+        feature_width="v6_balanced_96",
+        architecture_budget=V6_ARCHITECTURE_BUDGET,
+        upsample="nontrainable",
+    ).model_dump(mode="json")
+    request = SearchRequest.model_validate_json(
+        _request(SearchType.DIRECT, configuration, budget=1).model_dump_json()
+    )
+    assert isinstance(request.search_space["features"], list)
+
+    experiment = DirectSearchBackend(
+        ExperimentMetadata(
+            evaluator_id="feta-unet-search-evaluator",
+            code_version="test-code",
+            dataset_version="test-data",
+            provenance=ProvenanceKind.REAL,
+        ),
+        task.normalise_configuration,
+    ).create_experiment(
+        request,
+        default_feta_unet_search_contract(),
+        run_id="v6-direct-replay",
+    )
+    reconstructed = FeTAUNetSearchConfiguration.model_validate(
+        experiment.configuration
+    )
+
+    assert reconstructed.feature_width == "v6_balanced_96"
+    assert reconstructed.features == V6_BASIC_UNET_FEATURE_PROFILES[
+        "v6_balanced_96"
+    ]
+
+
+def test_generation_zero_reuses_exact_published_cross_method_experiment(tmp_path):
+    task = FeTAUNetSearchTask()
+    configuration = FeTAUNetSearchConfiguration(
+        maximum_epochs=25,
+        model_variant="basic_unet",
+        feature_width="v6_balanced_96",
+        architecture_budget=V6_ARCHITECTURE_BUDGET,
+        upsample="deconv",
+        learning_rate=2e-4,
+    ).model_dump(mode="json")
+    candidate_configuration = {
+        name: configuration[name] for name in CANDIDATE_CONFIGURATION_FIELDS
+    }
+    published = ExperimentSpec(
+        experiment_id="experiment-incumbent",
+        hypothesis_id="optuna-hypothesis",
+        search_request_id="optuna-request",
+        configuration=candidate_configuration,
+        evaluator_id="feta-basic-unet-search-evaluator",
+        code_version="search-evaluator-version",
+        dataset_version="feta-dataset-version",
+        provenance=ProvenanceKind.REAL,
+    )
+    proposed = published.model_copy(
+        update={
+            "hypothesis_id": "openevolve-hypothesis",
+            "search_request_id": "openevolve-request",
+            "configuration": configuration,
+        }
+    )
+    reference = "runs/run/experiment-incumbent/experiment_spec.json"
+    published_path = tmp_path / reference
+    published_path.parent.mkdir(parents=True)
+    published_path.write_text(published.model_dump_json(), encoding="utf-8")
+    record = SimpleNamespace(
+        expected_artefact_references=(reference,),
+        experiment_payload_hash=payload_hash(published),
+    )
+    store = SimpleNamespace(
+        get_evaluation_reuse=lambda run_id, experiment_id: record
+        if (run_id, experiment_id) == ("run", "experiment-incumbent")
+        else None
+    )
+    dependencies = SimpleNamespace(
+        provenance_store=store,
+        runtime_context=TaskRuntimeContext(run_id="run", output_dir=tmp_path),
+        task=task,
+    )
+    candidate = SimpleNamespace(generation=0)
+
+    reused = _canonical_generation_zero_experiment(
+        {"run_id": "run"}, dependencies, candidate, proposed
+    )
+    assert reused == published
+
+    conflicting = proposed.model_copy(
+        update={
+            "configuration": {
+                **configuration,
+                "learning_rate": 3e-4,
+            }
+        }
+    )
+    with pytest.raises(
+        ValueError, match="openevolve_incumbent_configuration_conflict"
+    ):
+        _canonical_generation_zero_experiment(
+            {"run_id": "run"}, dependencies, candidate, conflicting
+        )
+
+
 def test_openevolve_seed_executes_to_a_bounded_unet_experiment():
     task = FeTAUNetSearchTask()
     contract = default_feta_unet_search_contract()
@@ -380,7 +604,7 @@ def test_openevolve_seed_executes_to_a_bounded_unet_experiment():
     backend = OpenEvolveBackend(
         component,
         metadata,
-        "deterministic-verifier-v1@feta-basic-unet-search-evidence-policy-v1",
+        "deterministic-verifier-v1@feta-basic-unet-search-evidence-policy-v2",
         DeterministicMutationOperator(),
         LocalSandboxRunner(),
     )
@@ -426,9 +650,12 @@ def test_openevolve_uses_verified_initial_incumbent_and_observations():
         ),
     )
     assert component.seed_configuration()["seed_training_policy"] == {
-        "policy_version": "feta-unet-training-policy-v3",
+        "policy_version": "feta-unet-training-policy-v4",
         "model_variant": "unet_residual",
         "feature_width": "baseline",
+        "features": [32, 32, 64, 128, 256, 32],
+        "architecture_budget": "legacy",
+        "upsample": "deconv",
         "activation": "LeakyReLU",
         "norm": "instance",
         "optimizer": "AdamW",
@@ -506,7 +733,7 @@ def test_verified_optuna_incumbent_seeds_openevolve_and_parent_feedback():
     backend = OpenEvolveBackend(
         component,
         metadata,
-        "deterministic-verifier-v1@feta-basic-unet-search-evidence-policy-v1",
+        "deterministic-verifier-v1@feta-basic-unet-search-evidence-policy-v2",
         DeterministicMutationOperator(),
         LocalSandboxRunner(),
     )
@@ -516,6 +743,15 @@ def test_verified_optuna_incumbent_seeds_openevolve_and_parent_feedback():
     assert preparation.generated_configuration["learning_rate"] == 2e-4
     assert preparation.generated_configuration["augmentation_policy"] == "geometric"
     assert preparation.generated_configuration["model_variant"] == "unet_plain"
+    experiment = component.candidate_to_experiment(
+        seed,
+        preparation,
+        request,
+        contract,
+        metadata,
+        run_id="run",
+    )
+    assert experiment.experiment_id == "experiment-optuna-winner"
 
     outcome = CandidateOutcome(
         candidate_id=seed.candidate_id,
